@@ -79,3 +79,46 @@ export function songToTrack(song) {
     metadataSources: ['Downloads/Surdhara'],
   };
 }
+
+
+function filenameFromHeader(header) {
+  if (!header) return '';
+  const encoded = /filename\*=UTF-8''([^;]+)/i.exec(header);
+  if (encoded) { try { return decodeURIComponent(encoded[1]); } catch { /* use the plain name below */ } }
+  const plain = /filename="?([^";]+)"?/i.exec(header);
+  return plain ? plain[1] : '';
+}
+
+/**
+ * Public-server mode: the server makes the M4A, sends it to this browser, and deletes its own copy.
+ * The browser then saves it on THIS device (phone or computer), normally in the Downloads folder.
+ */
+export async function downloadToDevice(url, timeoutMs = 300000) {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(`${DOWNLOADER_BASE}/download/m4a?url=${encodeURIComponent(url)}`, { signal: controller.signal });
+    if (!response.ok) {
+      let body = null;
+      try { body = await response.json(); } catch { /* non-JSON error body */ }
+      throw Object.assign(new Error(body?.message || `The SURDHARA server answered ${response.status}.`), { status: response.status });
+    }
+    const blob = await response.blob();
+    const filename = filenameFromHeader(response.headers.get('Content-Disposition')) || 'song.m4a';
+    const objectUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = objectUrl;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 30000);
+    return { filename, size: blob.size };
+  } catch (error) {
+    if (error?.status) throw error;
+    if (error?.name === 'AbortError') throw new Error('The server took too long. Please try again.');
+    throw Object.assign(new Error('The SURDHARA server is not reachable.'), { unreachable: true });
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
