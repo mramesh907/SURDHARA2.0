@@ -1935,9 +1935,10 @@ export default function App() {
       <section className="page-heading">
         <span className="section-eyebrow"><FolderDown size={14} /> DOWNLOADS / SURDHARA</span>
         <h1>YouTube Downloads</h1>
-        <p>Paste a YouTube link to keep the song as an M4A file on your computer. Every song inside your Downloads/Surdhara folder is listed here and plays right in SURDHARA.</p>
+        <p>{downloader.state === 'online' && !downloader.folder ? 'Paste a YouTube link to save the song as an M4A file on this device. You can add it to SURDHARA afterwards with Import songs.' : 'Paste a YouTube link to keep the song as an M4A file on your computer. Every song inside your Downloads/Surdhara folder is listed here and plays right in SURDHARA.'}</p>
       </section>
       <SongDownloader serverState={downloader.state} folder={downloader.folder} ffmpeg={downloader.ffmpeg} onRecheck={refreshDownloader} onSongSaved={handleDeviceSongSaved} />
+      {!(downloader.state === 'online' && !downloader.folder) && (
       <section className="content-section">
         <div className="section-title-row downloader-songs-head">
           <div className="section-title-copy"><h2>Your downloaded songs</h2><p>{deviceTracks.length ? `${deviceTracks.length} song${deviceTracks.length === 1 ? '' : 's'} in your Downloads/Surdhara folder.` : 'Songs you download appear here.'}</p></div>
@@ -1953,6 +1954,7 @@ export default function App() {
           emptyText={downloader.state === 'online' ? 'Paste a YouTube link above and the song will be saved and listed here.' : 'Start the SURDHARA server (see above) to download songs and see everything saved in your Downloads/Surdhara folder.'}
         />
       </section>
+      )}
     </>
   );
 
