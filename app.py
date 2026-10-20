@@ -34,12 +34,14 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import io
 import json
 import mimetypes
 import os
 import re
 import shutil
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -104,6 +106,12 @@ SONGS_DIR.mkdir(parents=True, exist_ok=True)
 SONGS_DIR = SONGS_DIR.resolve()
 DIST_DIR = Path(__file__).resolve().parent / 'dist'
 
+# Public mode (SURDHARA_PUBLIC=1): for a server on the internet. The finished .m4a is sent to the visitor's
+# own device and then deleted from the server; nothing is listed, streamed or kept.
+PUBLIC_MODE = os.environ.get('SURDHARA_PUBLIC', '').strip().lower() in {'1', 'true', 'yes'}
+MAX_VIDEO_SECONDS = int(os.environ.get('SURDHARA_MAX_SECONDS', '1200') or 1200)      # longest video allowed
+RATE_LIMIT_PER_HOUR = int(os.environ.get('SURDHARA_RATE_LIMIT', '15') or 15)        # downloads per visitor per hour
+
 app = Flask(__name__, static_folder=None)
 app.json.sort_keys = False
 
@@ -133,7 +141,7 @@ def add_cors_headers(response):
         response.headers['Access-Control-Allow-Origin'] = origin
         response.headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS'
         response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Range'
-        response.headers['Access-Control-Expose-Headers'] = 'Content-Length, Content-Range, Accept-Ranges'
+        response.headers['Access-Control-Expose-Headers'] = 'Content-Length, Content-Range, Accept-Ranges, Content-Disposition'
         # Lets an https website talk to this server on your own computer (Chrome "Private Network Access").
         response.headers['Access-Control-Allow-Private-Network'] = 'true'
         response.headers['Access-Control-Max-Age'] = '600'
@@ -154,6 +162,45 @@ def guard_state_changing_requests():
         return jsonify({'status': 'error', 'message': 'This website is not allowed to use the SURDHARA server.'}), 403
     if not origin and request.headers.get('Sec-Fetch-Site') == 'cross-site':
         return jsonify({'status': 'error', 'message': 'Cross-site request blocked.'}), 403
+    return None
+
+
+_rate_hits: dict[str, list[float]] = {}
+_rate_lock = threading.Lock()
+
+
+def client_ip() -> str:
+    forwarded = request.headers.get('CF-Connecting-IP') or request.headers.get('X-Forwarded-For', '').split(',')[0]
+    return (forwarded or request.remote_addr or 'unknown').strip()
+
+
+def rate_limited() -> bool:
+    """Simple per-visitor limit so the public server cannot be drained by one person."""
+    now = time.time()
+    ip = client_ip()
+    with _rate_lock:
+        hits = [t for t in _rate_hits.get(ip, []) if now - t < 3600]
+        if len(hits) >= RATE_LIMIT_PER_HOUR:
+            _rate_hits[ip] = hits
+            return True
+        hits.append(now)
+        _rate_hits[ip] = hits
+        if len(_rate_hits) > 5000:
+            for key in [k for k, v in _rate_hits.items() if not v or now - v[-1] > 3600]:
+                _rate_hits.pop(key, None)
+    return False
+
+
+@app.before_request
+def public_mode_guard():
+    """On a public server nobody may list, stream or delete files, or start background jobs."""
+    if not PUBLIC_MODE or request.method == 'OPTIONS':
+        return None
+    path = request.path
+    if path == '/api/surdhara/songs':
+        return jsonify({'status': 'success', 'folder': '', 'songs': []})   # keeps the website's "server online" check happy
+    if path.startswith(('/api/surdhara/songs/', '/api/surdhara/stream/', '/api/surdhara/jobs', '/api/surdhara/download')):
+        return jsonify({'status': 'error', 'message': 'Not available on the public server.'}), 404
     return None
 
 
@@ -178,6 +225,21 @@ def write_index(index: dict) -> None:
         temp = target.with_suffix('.tmp')
         temp.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding='utf-8')
         os.replace(temp, target)
+
+
+def forget_song(path: Path) -> None:
+    """Public mode: remove a song (and its index entry) once it has been handed to the visitor."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    try:
+        with _index_lock:
+            index = read_index()
+            if index.pop(path.name, None) is not None:
+                write_index(index)
+    except Exception:  # noqa: BLE001 - cleanup must never break a response
+        pass
 
 
 def clean_artist(name: str | None) -> str:
@@ -319,7 +381,12 @@ def ydl_base_options() -> dict:
     if browser:
         options['cookiesfrombrowser'] = (browser,)
     elif cookie_file:
-        options['cookiefile'] = cookie_file
+        writable = Path(tempfile.gettempdir()) / 'surdhara-cookies.txt'
+        try:
+            shutil.copyfile(cookie_file, writable)   # yt-dlp rewrites the cookie file; secret mounts are read-only
+            options['cookiefile'] = str(writable)
+        except OSError:
+            options['cookiefile'] = cookie_file
     # Recent yt-dlp versions need a JavaScript runtime to read YouTube; use Node if Deno is not installed.
     if not shutil.which('deno') and shutil.which('node'):
         options['js_runtimes'] = {'node': {}}
@@ -361,13 +428,16 @@ def run_download(job: dict) -> None:
         if info.get('is_live') or info.get('live_status') in {'is_live', 'is_upcoming'}:
             raise DownloadError('Live streams and premieres cannot be downloaded until they have finished.')
 
+        if PUBLIC_MODE and (info.get('duration') or 0) > MAX_VIDEO_SECONDS:
+            raise DownloadError(f'Videos longer than {MAX_VIDEO_SECONDS // 60} minutes are not allowed on this server.')
+
         video_id = info.get('id') or ''
         title = info.get('title') or video_id
         artist = clean_artist(info.get('artist') or info.get('creator') or info.get('channel') or info.get('uploader'))
         update_job(job, title=title, videoId=video_id)
 
         index = read_index()
-        existing = find_existing(video_id, index)
+        existing = None if PUBLIC_MODE else find_existing(video_id, index)
         if existing:
             update_job(job, status='done', progress=100, message='Already in your Surdhara folder.',
                        song=song_record(existing, index), alreadyDownloaded=True)
@@ -447,7 +517,8 @@ def start_job(url: str) -> dict:
 @app.get('/api/surdhara/health')
 def health():
     return jsonify({
-        'status': 'ok', 'app': 'surdhara-server', 'version': APP_VERSION, 'folder': str(SONGS_DIR),
+        'status': 'ok', 'app': 'surdhara-server', 'version': APP_VERSION, 'folder': '' if PUBLIC_MODE else str(SONGS_DIR),
+        'public': PUBLIC_MODE,
         'ffmpeg': ffmpeg_available(), 'ytdlp': getattr(getattr(yt_dlp, 'version', None), '__version__', None),
         'ytdlpError': _YTDLP_IMPORT_ERROR or None,
     })
@@ -520,15 +591,24 @@ def download_m4a():
     url, error = normalise_youtube_url(raw)
     if error:
         return jsonify({'status': 'error', 'message': error}), 400
+    if PUBLIC_MODE and rate_limited():
+        return jsonify({'status': 'error', 'message': f'Download limit reached ({RATE_LIMIT_PER_HOUR} per hour). Please try again later.'}), 429
     job = new_job(url)
     with _download_slots:
         run_download(job)
     if job['status'] != 'done':
         return jsonify({'status': 'error', 'message': job['message']}), 502
     song = job['song']
-    if request.args.get('file') in {'1', 'true', 'yes'}:
+    send_file_now = PUBLIC_MODE or request.args.get('file') in {'1', 'true', 'yes'}
+    if send_file_now:
         path = safe_song_path(song['filename'])
         if path:
+            if PUBLIC_MODE:
+                # Hand the song over from memory and delete the server copy straight away:
+                # the file lives only on the visitor's own device afterwards.
+                data = path.read_bytes()
+                forget_song(path)
+                return send_file(io.BytesIO(data), mimetype='audio/mp4', as_attachment=True, download_name=path.name)
             return send_file(path, mimetype='audio/mp4', as_attachment=True, download_name=path.name)
     return jsonify({
         'status': 'success', 'message': job['message'], 'saved_to': str(SONGS_DIR / song['filename']), 'song': song,
@@ -565,9 +645,17 @@ def not_found(_error):
     return 'Not found', 404
 
 
+if PUBLIC_MODE:   # a fresh server never starts with someone else's leftovers
+    for _leftover in SONGS_DIR.iterdir():
+        try:
+            shutil.rmtree(_leftover) if _leftover.is_dir() else _leftover.unlink()
+        except OSError:
+            pass
+
+
 if __name__ == '__main__':
-    host = os.environ.get('SURDHARA_HOST', '127.0.0.1')
-    port = int(os.environ.get('SURDHARA_PORT', '5000'))
+    host = os.environ.get('SURDHARA_HOST', '0.0.0.0' if PUBLIC_MODE else '127.0.0.1')
+    port = int(os.environ.get('SURDHARA_PORT') or os.environ.get('PORT') or '5000')
     print('=' * 64)
     print(' SURDHARA server')
     print('=' * 64)
