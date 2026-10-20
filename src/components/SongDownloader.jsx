@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { AlertCircle, CheckCircle2, Download, FolderDown, LoaderCircle, Link2, RefreshCw, Terminal, X } from 'lucide-react';
-import { DOWNLOADER_BASE, SERVER_START_COMMAND, getDownloadJob, listDownloadJobs, startYouTubeDownload } from '../lib/downloaderApi.js';
+import { DOWNLOADER_BASE, SERVER_START_COMMAND, checkServer, downloadToDevice, getDownloadJob, listDownloadJobs, startYouTubeDownload } from '../lib/downloaderApi.js';
 
 const isFinal = (status) => status === 'done' || status === 'error';
 const MAX_MISSED_POLLS = 8;
@@ -30,7 +30,7 @@ function JobRow({ job, onDismiss }) {
       </span>
       <div className="downloader-job-copy">
         <strong title={title}>{title}</strong>
-        <span>{job.status === 'error' ? job.message : job.status === 'done' ? (job.alreadyDownloaded ? 'Already in Downloads/Surdhara' : 'Saved to Downloads/Surdhara as M4A') : job.message}</span>
+        <span>{job.status === 'error' ? job.message : job.status === 'done' ? (job.local ? job.message : job.alreadyDownloaded ? 'Already in Downloads/Surdhara' : 'Saved to Downloads/Surdhara as M4A') : job.message}</span>
         {working && <div className="downloader-bar" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={job.progress || 0}><i style={{ width: `${Math.max(3, job.progress || 0)}%` }} /></div>}
       </div>
       {!working && <button type="button" className="tiny-icon-button" onClick={() => onDismiss(job.id)} aria-label="Dismiss"><X size={15} /></button>}
@@ -50,6 +50,7 @@ export default function SongDownloader({ serverState = 'checking', folder = '', 
   const misses = useRef({});
   const announced = useRef(new Set());
   const ready = serverState === 'online';
+  const [publicMode, setPublicMode] = useState(false);   // true when the server is a public one that sends the file to this device
 
   const mergeJobs = (incoming) => setJobs((previous) => {
     const map = new Map(previous.map((job) => [job.id, job]));
@@ -64,9 +65,16 @@ export default function SongDownloader({ serverState = 'checking', folder = '', 
     }
   };
 
-  // Pick up downloads that are still running when you come back to this page.
   useEffect(() => {
     if (!ready) return undefined;
+    let active = true;
+    checkServer().then((health) => { if (active) setPublicMode(Boolean(health?.public)); }).catch(() => {});
+    return () => { active = false; };
+  }, [ready]);
+
+  // Pick up downloads that are still running when you come back to this page.
+  useEffect(() => {
+    if (!ready || publicMode) return undefined;
     let active = true;
     listDownloadJobs().then((result) => {
       if (!active) return;
@@ -74,12 +82,12 @@ export default function SongDownloader({ serverState = 'checking', folder = '', 
       if (running.length) mergeJobs(running);
     }).catch(() => {});
     return () => { active = false; };
-  }, [ready]);
+  }, [ready, publicMode]);
 
   // Poll the server while something is downloading.
   useEffect(() => {
     const timer = window.setInterval(async () => {
-      const active = jobsRef.current.filter((job) => !isFinal(job.status));
+      const active = jobsRef.current.filter((job) => !isFinal(job.status) && !job.local);
       if (!active.length) return;
       const updates = await Promise.all(active.map(async (job) => {
         try {
@@ -105,6 +113,24 @@ export default function SongDownloader({ serverState = 'checking', folder = '', 
     if (!links.length) { setError('Paste a YouTube link first.'); return; }
     setBusy(true);
     setError('');
+    if (publicMode) {
+      // Public server: each song is made on the server, sent to this device, and saved by the browser.
+      for (const link of links) {
+        const id = `local-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+        mergeJobs([{ id, url: link, local: true, status: 'downloading', progress: 25, createdAt: Date.now(), message: 'Preparing your song… this can take up to a minute.' }]);
+        try {
+          const saved = await downloadToDevice(link);
+          mergeJobs([{ id, status: 'done', progress: 100, title: saved.filename.replace(/\.m4a$/i, ''), message: 'Saved on this device (check your Downloads folder).' }]);
+        } catch (caught) {
+          mergeJobs([{ id, status: 'error', message: caught.message }]);
+          if (caught.unreachable) onRecheck?.();
+          break;
+        }
+      }
+      setUrl('');
+      setBusy(false);
+      return;
+    }
     const started = [];
     for (const link of links) {
       try {
@@ -134,7 +160,7 @@ export default function SongDownloader({ serverState = 'checking', folder = '', 
         <span className="importer-icon"><Download size={20} /></span>
         <div>
           <h2 id="downloader-title">Add a song from YouTube</h2>
-          <p>Paste a video link. SURDHARA saves the audio as an M4A file in your <strong>Downloads/Surdhara</strong> folder and lists it below.</p>
+          <p>{publicMode ? <>Paste a video link. SURDHARA saves the audio as an M4A file <strong>on this device</strong>, usually in your Downloads folder.</> : <>Paste a video link. SURDHARA saves the audio as an M4A file in your <strong>Downloads/Surdhara</strong> folder and lists it below.</>}</p>
         </div>
       </div>
 
@@ -152,11 +178,11 @@ export default function SongDownloader({ serverState = 'checking', folder = '', 
           <p className="importer-help">Only a single video per link (playlist links are not downloaded). You can paste several links separated by a space or new line.</p>
           <button className="primary-button importer-submit" type="submit" disabled={busy || !url.trim()}>
             {busy ? <LoaderCircle size={16} className="spin-icon" /> : <FolderDown size={17} />}
-            {busy ? 'Starting…' : 'Download as M4A'}
+            {busy ? (publicMode ? 'Downloading…' : 'Starting…') : 'Download as M4A'}
           </button>
           {error && <div className="importer-alert importer-alert-error" role="alert"><AlertCircle size={17} /><span>{error}</span></div>}
-          {ffmpeg === false && <p className="importer-help">ffmpeg was not found on your computer. Most videos still work; install ffmpeg to support every video and embed song tags.</p>}
-          {folder && <p className="importer-help downloader-folder">Saving to <code>{folder}</code></p>}
+          {!publicMode && ffmpeg === false && <p className="importer-help">ffmpeg was not found on your computer. Most videos still work; install ffmpeg to support every video and embed song tags.</p>}
+          {folder && !publicMode && <p className="importer-help downloader-folder">Saving to <code>{folder}</code></p>}
         </form>
       )}
 
