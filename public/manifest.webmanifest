@@ -1,0 +1,22 @@
+{
+  "name": "SURDHARA — Your Sounds, Your Feelings",
+  "short_name": "SURDHARA",
+  "description": "Discover songs, artists and playlists. Works offline with your saved songs.",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#101016",
+  "theme_color": "#101016",
+  "categories": ["music", "entertainment"],
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Discover", "url": "/#/discover", "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }] },
+    { "name": "Liked songs", "url": "/#/liked", "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }] }
+  ]
+}
